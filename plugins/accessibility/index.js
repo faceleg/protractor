@@ -49,25 +49,28 @@ var TENON_URL = 'http://www.tenon.io/api/';
  * Checks the information returned by the accessibility audit(s) and
  * displays passed/failed results as console output.
  *
- * @this {Object} The plugin context object
- * @return {q.Promise} A promise which resolves when all audits are finished
+ * @param {Object} config The configuration file for the accessibility plugin
+ * @return {q.Promise} A promise which resolves to the results of any passed or
+ *    failed tests
  * @public
  */
-function teardown() {
+function teardown(config) {
 
   var audits = [];
 
-  if (this.config.chromeA11YDevTools) {
-    audits.push(runChromeDevTools(this));
+  if (config.chromeA11YDevTools) {
+    audits.push(runChromeDevTools(config));
   }
   // check for Tenon config and an actual API key, not the placeholder
-  if (this.config.tenonIO && /[A-Za-z][0-9]/.test(
-      this.config.tenonIO.options.key)) {
-    audits.push(runTenonIO(this));
+  if (config.tenonIO && /[A-Za-z][0-9]/.test(config.tenonIO.options.key)) {
+    audits.push(runTenonIO(config));
   }
-  return q.all(audits);
+  return q.all(audits).then(function() {
+    return outputResults();
+  });
 }
 
+var testOut = {failedCount: 0, specResults: []};
 var entities = new Entities();
 
 /**
@@ -75,15 +78,16 @@ var entities = new Entities();
  * more information about licensing and configuration available at
  * http://tenon.io/documentation/overview.php.
  *
- * @param {Object} context The plugin context object
- * @return {q.Promise} A promise which resolves when the audit is finished
+ * @param {Object} config The configuration file for the accessibility plugin
+ * @return {q.Promise} A promise which resolves to the results of any passed or
+ *    failed tests
  * @private
  */
-function runTenonIO(context) {
+function runTenonIO(config) {
 
   return browser.driver.getPageSource().then(function(source) {
 
-    var options = _.assign(context.config.tenonIO.options, {src: source});
+    var options = _.assign(config.tenonIO.options, {src: source});
 
     // setup response as a deferred promise
     var deferred = q.defer();
@@ -118,22 +122,39 @@ function runTenonIO(context) {
 
     var numResults = response.resultSet.length;
 
+    testOut.failedCount = numResults;
+
     if (numResults === 0) {
-      context.addSuccess();
-      return;
+      return testOut.specResults.push({
+        description: testHeader + 'All tests passed!',
+        assertions: [{
+          passed: true,
+          errorMsg: ''
+        }],
+        duration: 1
+      });
     }
 
-    if (context.config.tenonIO.printAll) {
+    if (config.tenonIO.printAll) {
       console.log('\x1b[32m', testHeader + 'API response', '\x1b[39m');
       console.log(response);
     }
 
     return response.resultSet.forEach(function(result) {
       var ref = (result.ref === null) ? '' : result.ref;
+      var errorMsg = result.errorDescription + '\n\n' +
+                     '\t\t' +entities.decode(result.errorSnippet) +
+                     '\n\n\t\t' + ref + '\n';
 
-      context.addFailure(result.errorDescription + '\n\n' +
-          '\t\t' +entities.decode(result.errorSnippet) +
-          '\n\n\t\t' + ref, {specName: testHeader + result.errorTitle});
+
+      testOut.specResults.push({
+        description: testHeader + result.errorTitle,
+        assertions: [{
+          passed: false,
+          errorMsg: errorMsg
+        }],
+        duration: 1
+      });
     });
   }
 }
@@ -141,14 +162,28 @@ function runTenonIO(context) {
 /**
  * Audits page source against the Chrome Accessibility Developer Tools, if configured.
  *
- * @param {Object} context The plugin context object
- * @return {q.Promise} A promise which resolves when the audit is finished
+ * @param {Object} config The configuration file for the accessibility plugin
+ * @return {q.Promise} A promise which resolves to the results of any passed or
+ *    failed tests
  * @private
  */
-function runChromeDevTools(context) {
+function runChromeDevTools(config) {
+
+  if (typeof config.chromeA11YDevTools.showUnsupportedRulesWarning === 'undefined') {
+    config.chromeA11YDevTools.showUnsupportedRulesWarning = true;
+  }
 
   var data = fs.readFileSync(AUDIT_FILE, 'utf-8');
-  data = data + ' return axs.Audit.run();';
+  data += 'var configuration = new axs.AuditConfiguration();'
+
+  if (!config.chromeA11YDevTools.showUnsupportedRulesWarning) {
+    data += [
+      'configuration.showUnsupportedRulesWarning = false;',
+    ].join('');
+  }
+
+  data = data + ' return axs.Audit.run(configuration);';
+  console.log(data);
 
   var elementPromises = [],
       elementStringLength = 200;
@@ -178,12 +213,6 @@ function runChromeDevTools(context) {
                 code: result.rule.code,
                 list: trimText(text)
               };
-            },
-            function(reason){
-              return {
-                code: result.rule.code,
-                list: reason
-              };
             })
           );
         });
@@ -199,10 +228,11 @@ function runChromeDevTools(context) {
         if (result.result === 'FAIL') {
           var label = result.elementCount === 1 ? ' element ' : ' elements ';
           if (result.rule.severity !== 'Warning'
-              || context.config.chromeA11YDevTools.treatWarningsAsFailures) {
-            result.warning = false;
+              || config.chromeA11YDevTools.treatWarningsAsFailures) {
+            result.passed = false;
+            testOut.failedCount++;
           } else {
-            result.warning = true;
+            result.passed = true;
             result.rule.heading = '\x1b[33m(WARNING) '
                 + result.rule.heading + ' (' + result.elementCount
                 + label + 'failed)';
@@ -217,15 +247,35 @@ function runChromeDevTools(context) {
             }
           });
           result.output += '\n\n\t\t' + result.rule.url;
-          (result.warning ? context.addWarning : context.addFailure)(
-              result.output, {specName: testHeader + result.rule.heading});
         }
         else {
-          context.addSuccess({specName: testHeader + result.rule.heading});
+          result.passed = true;
+          result.output = '';
         }
+
+        testOut.specResults.push({
+          description: testHeader + result.rule.heading,
+          assertions: [{
+            passed: result.passed,
+            errorMsg: result.output
+          }],
+          duration: 1
+        });
       });
     });
   });
+}
+
+/**
+ * Output results from either plugin configuration.
+ *
+ * @return {object} testOut An object containing number of failures and spec results
+ * @private
+ */
+function outputResults() {
+  if ((testOut.failedCount > 0) || (testOut.specResults.length > 0)) {
+    return testOut;
+  }
 }
 
 // Export
